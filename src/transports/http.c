@@ -265,8 +265,43 @@ static int set_authentication_types(http_server *server)
 	return 0;
 }
 
+static bool auth_context_complete(http_server *server)
+{
+	/* If there's no is_complete function, we're always complete */
+	if (!server->auth_context->is_complete)
+		return true;
+
+	if (server->auth_context->is_complete(server->auth_context))
+		return true;
+
+	return false;
+}
+
+static void free_auth_context(http_server *server)
+{
+	if (!server->auth_context)
+		return;
+
+	if (server->auth_context->free)
+		server->auth_context->free(server->auth_context);
+
+	server->auth_context = NULL;
+}
+
 static int parse_authenticate_response(http_server *server)
 {
+	/*
+	 * If we think that we've completed authentication (ie, we've either
+	 * sent a basic credential or we've sent the NTLM/Negotiate response)
+	 * but we've got an authentication request from the server then our
+	 * last authentication did not succeed.  Start over.
+	 */
+	if (server->auth_context && auth_context_complete(server)) {
+		free_auth_context(server);
+
+		server->authenticated = 0;
+	}
+
 	/*
 	 * If we've begun authentication, give the challenge to the context.
 	 * Otherwise, set up the types to prepare credentials.
@@ -365,17 +400,6 @@ static int on_header_value(http_parser *parser, const char *str, size_t len)
 
 	t->last_cb = VALUE;
 	return 0;
-}
-
-static void free_auth_context(http_server *server)
-{
-	if (!server->auth_context)
-		return;
-
-	if (server->auth_context->free)
-		server->auth_context->free(server->auth_context);
-
-	server->auth_context = NULL;
 }
 
 GIT_INLINE(void) free_cred(git_cred **cred)
@@ -534,9 +558,7 @@ static int on_headers_complete(http_parser *parser)
 	if (parser->status_code == 407 || parser->status_code == 401) {
 		http_server *server = parser->status_code == 407 ? &t->proxy : &t->server;
 
-		if (server->auth_context &&
-		    server->auth_context->is_complete &&
-		    !server->auth_context->is_complete(server->auth_context)) {
+		if (server->auth_context && !auth_context_complete(server)) {
 			t->parse_error = PARSE_ERROR_REPLAY;
 			return 0;
 		}
@@ -861,9 +883,7 @@ static int proxy_headers_complete(http_parser *parser)
 
 	/* If we're in the middle of challenge/response auth, continue */
 	if (parser->status_code == 407) {
-		if (t->proxy.auth_context &&
-		    t->proxy.auth_context->is_complete &&
-		    !t->proxy.auth_context->is_complete(t->proxy.auth_context)) {
+		if (t->proxy.auth_context && !auth_context_complete(&t->proxy)) {
 			t->parse_error = PARSE_ERROR_REPLAY;
 			return 0;
 		}
